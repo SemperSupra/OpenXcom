@@ -1,3 +1,4 @@
+# Public CI surface for the reviewed compile-observer candidate.
 name: Compile observer candidate
 
 on:

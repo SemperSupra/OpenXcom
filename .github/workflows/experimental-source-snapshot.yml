@@ -51,16 +51,20 @@ jobs:
             url="$(jq -r '.html_url' <<<"$row")"
             echo "compile gate: status=${status} conclusion=${conclusion} ${url}"
 
-            if [[ "$status" == "completed" ]]; then
-              if [[ "$conclusion" != "success" ]]; then
-                echo "public engine build/release gate did not succeed" >&2
-                exit 1
-              fi
+            if [[ "$status" == "completed" && "$conclusion" == "success" ]]; then
               exit 0
+            fi
+
+            if [[ "$status" == "completed" && "$conclusion" != "success" ]]; then
+              # A failed post-publish verifier may be retried in-place and turn
+              # the same workflow run green. Keep the source firewall closed,
+              # but wait for the bounded observation window rather than making
+              # the first transient conclusion permanent for this candidate.
+              echo "compile/release gate currently ${conclusion}; waiting for any in-place failed-job rerun (${attempt}/70)"
             fi
             sleep 20
           done
-          echo "timed out waiting for public engine build/release gate" >&2
+          echo "timed out waiting for a successful public engine build/release gate" >&2
           exit 1
 
       - name: Download and validate current release evidence
@@ -70,11 +74,22 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          gh release download "$EXPERIMENTAL_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern experimental-build-manifest.json \
-            --pattern SHA256SUMS.txt \
-            --dir dist
+          for attempt in $(seq 1 12); do
+            rm -f dist/experimental-build-manifest.json dist/SHA256SUMS.txt
+            if gh release download "$EXPERIMENTAL_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern experimental-build-manifest.json \
+              --pattern SHA256SUMS.txt \
+              --dir dist; then
+              break
+            fi
+            if [[ "$attempt" == "12" ]]; then
+              echo "release evidence did not become downloadable" >&2
+              exit 1
+            fi
+            echo "release evidence not ready yet (${attempt}/12)"
+            sleep 10
+          done
 
           python3 <<'PY'
           import json, os, pathlib
@@ -173,7 +188,9 @@ jobs:
           set -euo pipefail
           env -u GH_TOKEN -u GITHUB_TOKEN python3 <<'PY'
           from hashlib import sha256
+          from time import sleep
           import json, os
+          from urllib.error import HTTPError, URLError
           from urllib.request import Request, urlopen
 
           repo = os.environ['GITHUB_REPOSITORY']
@@ -182,8 +199,20 @@ jobs:
           headers = {'User-Agent': 'SemperSupra-source-snapshot-verifier/1'}
 
           def get(url: str) -> bytes:
-              with urlopen(Request(url, headers=headers), timeout=120) as response:
-                  return response.read()
+              last = None
+              for attempt in range(1, 13):
+                  try:
+                      with urlopen(Request(url, headers=headers), timeout=120) as response:
+                          return response.read()
+                  except (HTTPError, URLError) as exc:
+                      last = exc
+                      if isinstance(exc, HTTPError) and exc.code not in (404, 429, 500, 502, 503, 504):
+                          raise
+                      if attempt == 12:
+                          raise
+                      print(f'public asset not ready ({attempt}/12): {exc}')
+                      sleep(10)
+              raise last
 
           release = json.loads(get(f'https://api.github.com/repos/{repo}/releases/tags/{tag}').decode('utf-8'))
           assets = {a['name']: a for a in release.get('assets', [])}

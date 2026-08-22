@@ -7,7 +7,7 @@ on:
       - semper/compile-observer
   pull_request:
     branches:
-      - oxce-plus
+      - semper/oxce-8.6.5-base
   workflow_dispatch:
 
 jobs:
@@ -28,34 +28,26 @@ jobs:
       - name: Run smoke test
         run: /tmp/compile-observer-smoke
 
-  windows-engine-build:
-    name: Windows engine build
-    runs-on: windows-latest
+  linux-engine-build:
+    name: Full Linux engine build
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Install XP toolset used by upstream nightly
-        shell: powershell
+      - name: Install OXCE build dependencies
         run: |
-          Set-Location "C:\Program Files (x86)\Microsoft Visual Studio\Installer\"
-          $InstallPath = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise"
-          $WorkLoads = '--add Microsoft.VisualStudio.Component.WinXP'
-          $Arguments = ('/c', "vs_installer.exe", 'modify', '--installPath', "`"$InstallPath`"", $WorkLoads, '--quiet', '--norestart', '--nocache')
-          $process = Start-Process -FilePath cmd.exe -ArgumentList $Arguments -Wait -PassThru -WindowStyle Hidden
-          if ($process.ExitCode -ne 0) {
-              throw "XP toolset installation failed with exit code $($process.ExitCode)"
-          }
+          sudo apt-get update
+          sudo apt-get -yq --no-install-suggests --no-install-recommends install \
+            libsdl1.2-dev \
+            libsdl-mixer1.2-dev \
+            libsdl-image1.2-dev \
+            libsdl-gfx1.2-dev
 
-      - name: Add MSBuild to PATH
-        uses: microsoft/setup-msbuild@v2
+      - name: Configure OXCE
+        run: cmake . -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
 
-      - name: Compile OXCE using upstream nightly configuration
-        env:
-          VC_FLAGS: /v:minimal /m /p:BuildInParallel=true /p:PreferredToolArchitecture=x64 /p:Configuration=Release_XP
-        shell: powershell
-        run: |
-          Set-Location src
-          msbuild OpenXcom.2010.sln $env:VC_FLAGS /p:Platform=Win32
+      - name: Compile full OXCE engine
+        run: make -j$(nproc)

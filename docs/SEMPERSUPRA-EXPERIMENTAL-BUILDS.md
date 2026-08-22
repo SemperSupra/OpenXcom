@@ -205,3 +205,31 @@ runs-on: windows-2022
 and compile the solution's ordinary supported `Release|Win32` configuration. `OpenXcom.2010.sln` and `OpenXcom.2010.vcxproj` define both `Release` and the legacy `Release_XP` configurations; `Release` uses the runner's default supported platform toolset, while `Release_XP` explicitly requests `v141_xp`.
 
 The public compile gate therefore validates modern Windows compilation without dynamically installing the obsolete XP toolset. If an actual Windows-XP-compatible distribution is ever required, treat that as a separate compatibility/release job with its own maintained toolchain rather than making it a prerequisite for ordinary CI.
+
+## Release source and generator-validator boundary
+
+Every public binary release must remain tied to public source that is sufficient to satisfy the applicable license and rebuild the distributed binary. For this GPL fork, the public release contract is **complete corresponding source**, not a deliberately reduced implementation.
+
+The public release tag already identifies an exact public source commit and GitHub exposes source archives for that tag. The stronger target state is to also publish an explicitly named source snapshot whose SHA-256 is recorded in `experimental-build-manifest.json` alongside the platform binaries.
+
+The source snapshot must be generated from the exact reviewed **public** candidate commit. It must never be created by archiving the private development repository and deleting known-private paths afterward.
+
+The public/private split is based on semantic role rather than file format. Private validation/evaluation assets may remain private when they are not required corresponding source, including comprehensive conformance corpora, adversarial/regression knowledge, proprietary-data test environments, private compatibility matrices, fuzz/evaluation knowledge, and other validator/control-plane evidence. Ordinary public build/smoke tests remain public where they are part of the public build and trust contract.
+
+This preserves a generator-validator asymmetry:
+
+```text
+private validation/control plane
+    judges reviewed implementation
+             |
+             v
+public source candidate
+    -> public CI/build
+    -> platform binaries
+    -> corresponding source snapshot
+    -> hashes/provenance
+```
+
+A public implementation can therefore be reproducible and GPL-compliant without publishing every private asset used to decide whether candidate behavior is acceptable.
+
+For downstream Windows distribution, Windows Package Foundry should index immutable preview/stable Windows releases and their provenance rather than becoming a source-code mirror. The mutable `semper-exp-current` channel remains primarily a development acquisition channel unless Foundry later defines an explicit experimental-feed policy.

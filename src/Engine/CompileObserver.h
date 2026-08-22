@@ -19,7 +19,12 @@
  */
 
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
+#include <fstream>
+#include <memory>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 
 namespace OpenXcom
@@ -87,6 +92,91 @@ public:
 
 namespace CompileObserverDetail
 {
+inline const char *eventKindName(CompileEventKind kind) noexcept
+{
+	switch (kind)
+	{
+	case CompileEventKind::PhaseBegin: return "phase-begin";
+	case CompileEventKind::PhaseEnd: return "phase-end";
+	case CompileEventKind::RuleOperation: return "rule-operation";
+	case CompileEventKind::LinkResult: return "link-result";
+	case CompileEventKind::ResourceResolution: return "resource-resolution";
+	case CompileEventKind::FilesystemWriteIntent: return "filesystem-write-intent";
+	case CompileEventKind::Snapshot: return "snapshot";
+	}
+	return "unknown";
+}
+
+class EnvironmentJsonlObserver final : public CompileObserver
+{
+public:
+	explicit EnvironmentJsonlObserver(const std::string &path) :
+		_out(path, std::ios::out | std::ios::trunc)
+	{
+		if (!_out)
+		{
+			throw std::runtime_error("could not open compile observer trace: " + path);
+		}
+	}
+
+	void onCompileEvent(const CompileEvent &event) override
+	{
+		_out << "{\"schema\":" << event.schemaVersion << ",\"kind\":";
+		writeJsonString(eventKindName(event.kind));
+		_out << ",\"phase\":";
+		writeJsonString(event.phase);
+		_out << ",\"category\":";
+		writeJsonString(event.category);
+		_out << ",\"operation\":";
+		writeJsonString(event.operation);
+		_out << ",\"identity\":";
+		writeJsonString(event.identity);
+		_out << ",\"source\":";
+		writeJsonString(event.source);
+		_out << ",\"outcome\":";
+		writeJsonString(event.outcome);
+		_out << "}\n";
+		_out.flush();
+		if (!_out)
+		{
+			throw std::runtime_error("failed writing compile observer trace");
+		}
+	}
+
+private:
+	void writeJsonString(std::string_view value)
+	{
+		_out.put('"');
+		for (const char raw : value)
+		{
+			const unsigned char ch = static_cast<unsigned char>(raw);
+			switch (ch)
+			{
+			case '"': _out << "\\\""; break;
+			case '\\': _out << "\\\\"; break;
+			case '\b': _out << "\\b"; break;
+			case '\f': _out << "\\f"; break;
+			case '\n': _out << "\\n"; break;
+			case '\r': _out << "\\r"; break;
+			case '\t': _out << "\\t"; break;
+			default:
+				if (ch < 0x20)
+				{
+					static const char hex[] = "0123456789abcdef";
+					_out << "\\u00" << hex[(ch >> 4) & 0x0f] << hex[ch & 0x0f];
+				}
+				else
+				{
+					_out.put(static_cast<char>(ch));
+				}
+			}
+		}
+		_out.put('"');
+	}
+
+	std::ofstream _out;
+};
+
 inline CompileObserver *&observerSlot() noexcept
 {
 	static CompileObserver *observer = nullptr;
@@ -98,6 +188,43 @@ inline bool &failureSlot() noexcept
 	static bool failed = false;
 	return failed;
 }
+
+inline bool &environmentCheckedSlot() noexcept
+{
+	static bool checked = false;
+	return checked;
+}
+
+inline std::unique_ptr<EnvironmentJsonlObserver> &environmentObserverSlot() noexcept
+{
+	static std::unique_ptr<EnvironmentJsonlObserver> observer;
+	return observer;
+}
+
+inline void tryInstallEnvironmentObserver() noexcept
+{
+	if (environmentCheckedSlot() || observerSlot())
+	{
+		return;
+	}
+	environmentCheckedSlot() = true;
+
+	const char *path = std::getenv("OXCE_COMPILE_TRACE");
+	if (!path || !*path)
+	{
+		return;
+	}
+
+	try
+	{
+		environmentObserverSlot() = std::make_unique<EnvironmentJsonlObserver>(path);
+		observerSlot() = environmentObserverSlot().get();
+	}
+	catch (...)
+	{
+		failureSlot() = true;
+	}
+}
 }
 
 /**
@@ -108,6 +235,7 @@ inline bool &failureSlot() noexcept
 inline CompileObserver *setCompileObserver(CompileObserver *observer) noexcept
 {
 	CompileObserver *previous = CompileObserverDetail::observerSlot();
+	CompileObserverDetail::environmentCheckedSlot() = true;
 	CompileObserverDetail::observerSlot() = observer;
 	CompileObserverDetail::failureSlot() = false;
 	return previous;
@@ -115,16 +243,22 @@ inline CompileObserver *setCompileObserver(CompileObserver *observer) noexcept
 
 /**
  * Returns the currently installed observer, or nullptr when disabled.
+ *
+ * When no observer was installed explicitly, the first call checks the
+ * OXCE_COMPILE_TRACE environment variable once. If it names a file, a minimal
+ * JSON Lines sink is installed for the lifetime of the process.
  */
 inline CompileObserver *getCompileObserver() noexcept
 {
+	CompileObserverDetail::tryInstallEnvironmentObserver();
 	return CompileObserverDetail::observerSlot();
 }
 
 /**
- * Reports whether the installed observer threw while handling an event.
+ * Reports whether the installed observer threw while handling an event or the
+ * environment-requested trace sink could not be created.
  *
- * The exception is deliberately contained to preserve authoritative engine
+ * The failure is deliberately contained to preserve authoritative engine
  * behavior. Evidence-producing modes can treat this flag as a hard failure.
  */
 inline bool compileObserverFailed() noexcept

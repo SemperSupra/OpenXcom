@@ -18,11 +18,15 @@
  * along with OpenXcom.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <ctime>
 #include <exception>
 #include <fstream>
+#include <iomanip>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -107,11 +111,45 @@ inline const char *eventKindName(CompileEventKind kind) noexcept
 	return "unknown";
 }
 
+inline std::string iso8601UtcNow()
+{
+	using namespace std::chrono;
+	const system_clock::time_point now = system_clock::now();
+	const milliseconds millis = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
+	const std::time_t raw = system_clock::to_time_t(now);
+	std::tm utc{};
+#ifdef _WIN32
+	gmtime_s(&utc, &raw);
+#else
+	gmtime_r(&raw, &utc);
+#endif
+	std::ostringstream out;
+	out << std::put_time(&utc, "%Y-%m-%dT%H:%M:%S")
+		<< '.' << std::setw(3) << std::setfill('0') << millis.count() << 'Z';
+	return out.str();
+}
+
+inline std::string environmentCorrelationId()
+{
+	const char *value = std::getenv("OXCE_CORRELATION_ID");
+	if (value && *value)
+	{
+		return value;
+	}
+
+	using namespace std::chrono;
+	const auto micros = duration_cast<microseconds>(system_clock::now().time_since_epoch()).count();
+	std::ostringstream out;
+	out << "oxce-local-" << micros;
+	return out.str();
+}
+
 class EnvironmentJsonlObserver final : public CompileObserver
 {
 public:
 	explicit EnvironmentJsonlObserver(const std::string &path) :
-		_out(path, std::ios::out | std::ios::trunc)
+		_out(path, std::ios::out | std::ios::trunc),
+		_correlationId(environmentCorrelationId())
 	{
 		if (!_out)
 		{
@@ -121,7 +159,11 @@ public:
 
 	void onCompileEvent(const CompileEvent &event) override
 	{
-		_out << "{\"schema\":" << event.schemaVersion << ",\"kind\":";
+		_out << "{\"schema\":" << event.schemaVersion << ",\"timestamp\":";
+		writeJsonString(iso8601UtcNow());
+		_out << ",\"correlation_id\":";
+		writeJsonString(_correlationId);
+		_out << ",\"sequence\":" << ++_sequence << ",\"kind\":";
 		writeJsonString(eventKindName(event.kind));
 		_out << ",\"phase\":";
 		writeJsonString(event.phase);
@@ -175,6 +217,8 @@ private:
 	}
 
 	std::ofstream _out;
+	std::string _correlationId;
+	std::uint64_t _sequence = 0;
 };
 
 inline CompileObserver *&observerSlot() noexcept

@@ -6,6 +6,9 @@
 #include "../src/Engine/CompileObserver.h"
 
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 
@@ -109,6 +112,32 @@ int main()
 	assert(getCompileObserver() == nullptr);
 	assert(!compileObserverVisibleFromOtherTranslationUnit());
 	assert(!compileObserverFailed());
+
+	// The JSONL sink must envelope every semantic event with automation-safe
+	// timestamp/correlation/sequence metadata without changing schema 1 fields.
+	const char *tracePath = "/tmp/compile-observer-envelope-smoke.jsonl";
+	setenv("OXCE_CORRELATION_ID", "observer-smoke-correlation", 1);
+	{
+		CompileObserverDetail::EnvironmentJsonlObserver jsonl(tracePath);
+		CompileEvent jsonEvent;
+		jsonEvent.kind = CompileEventKind::Snapshot;
+		jsonEvent.phase = "validate-rulesets";
+		jsonEvent.category = "items";
+		jsonEvent.operation = "effective-rule";
+		jsonEvent.identity = "STR_SMOKE";
+		jsonEvent.source = "SmokeMod";
+		jsonEvent.outcome = "present";
+		jsonl.onCompileEvent(jsonEvent);
+	}
+	std::ifstream trace(tracePath);
+	std::string line;
+	std::getline(trace, line);
+	assert(line.find("\"timestamp\":\"") != std::string::npos);
+	assert(line.find("Z\"") != std::string::npos);
+	assert(line.find("\"correlation_id\":\"observer-smoke-correlation\"") != std::string::npos);
+	assert(line.find("\"sequence\":1") != std::string::npos);
+	assert(line.find("\"identity\":\"STR_SMOKE\"") != std::string::npos);
+	std::remove(tracePath);
 
 	return 0;
 }

@@ -51,3 +51,21 @@ jobs:
 
       - name: Compile full OXCE engine
         run: make -j$(nproc)
+
+  windows-engine-build:
+    name: Full Windows engine build
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Compile OXCE Win32 Release
+        shell: powershell
+        run: |
+          Set-Location src
+          msbuild OpenXcom.2010.sln /v:minimal /m /p:BuildInParallel=true /p:PreferredToolArchitecture=x64 /p:Configuration=Release /p:Platform=Win32

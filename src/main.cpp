@@ -112,6 +112,91 @@ static bool validateRulesetsRequested() noexcept
 }
 
 /**
+ * Emits a deliberately bounded final-state view for the validate-only path.
+ *
+ * This does not reconstruct loader semantics. The real OXCE loader has already
+ * completed successfully; these events only expose identities that survived
+ * into the final item/research maps plus OXCE's existing creation/update
+ * tracking. Observation failures are contained so they cannot change the
+ * loader result.
+ */
+template <typename T>
+static void emitEffectiveRuleSnapshot(const Mod &mod, std::string_view category, const std::string &identity, const T *rule) noexcept
+{
+	if (!getCompileObserver())
+	{
+		return;
+	}
+
+	CompileEvent created;
+	created.kind = CompileEventKind::Snapshot;
+	created.phase = "validate-rulesets";
+	created.category = category;
+	created.operation = "created-by";
+	created.identity = identity;
+	created.outcome = "present";
+	try
+	{
+		const ModData *source = mod.getModCreatingRule(rule);
+		if (source)
+		{
+			created.source = source->name;
+		}
+	}
+	catch (...)
+	{
+		created.outcome = "provenance-unavailable";
+	}
+	emitCompileEvent(created);
+
+	CompileEvent effective;
+	effective.kind = CompileEventKind::Snapshot;
+	effective.phase = "validate-rulesets";
+	effective.category = category;
+	effective.operation = "effective-rule";
+	effective.identity = identity;
+	effective.outcome = "present";
+	try
+	{
+		const ModData *source = mod.getModLastUpdatingRule(rule);
+		if (source)
+		{
+			effective.source = source->name;
+		}
+	}
+	catch (...)
+	{
+		effective.outcome = "provenance-unavailable";
+	}
+	emitCompileEvent(effective);
+}
+
+static void emitValidateOnlySnapshots(const Mod &mod) noexcept
+{
+	if (!getCompileObserver())
+	{
+		return;
+	}
+
+	for (const std::string &identity : mod.getItemsList())
+	{
+		const RuleItem *rule = mod.getItem(identity, false);
+		if (rule)
+		{
+			emitEffectiveRuleSnapshot(mod, "items", identity, rule);
+		}
+	}
+	for (const std::string &identity : mod.getResearchList())
+	{
+		const RuleResearch *rule = mod.getResearch(identity, false);
+		if (rule)
+		{
+			emitEffectiveRuleSnapshot(mod, "research", identity, rule);
+		}
+	}
+}
+
+/**
  * Runs the authoritative mod/VFS/ruleset load without constructing Game.
  *
  * This is intentionally environment-gated for the private spike so the
@@ -136,6 +221,7 @@ static int validateRulesetsAndExit()
 		Mod::resetGlobalStatics();
 		mod.reset(new Mod());
 		mod->loadAll();
+		emitValidateOnlySnapshots(*mod);
 
 		// The normal Game owns an initialized mixer. This headless path does not;
 		// silence destructor-time playback cleanup after validation has completed.

@@ -1,0 +1,206 @@
+name: Harden experimental source release
+
+on:
+  push:
+    branches:
+      - semper/compile-observer
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: semper-exp-source-snapshot
+  cancel-in-progress: true
+
+env:
+  EXPERIMENTAL_TAG: semper-exp-current
+  UPSTREAM_BASE_VERSION: 8.6.5
+
+jobs:
+  source-snapshot:
+    name: Attach exact public source snapshot
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout exact public candidate
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Wait for public engine build/release gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          candidate="${GITHUB_SHA}"
+          for attempt in $(seq 1 70); do
+            payload="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${candidate}&per_page=100")"
+            row="$(jq -c '[.workflow_runs[] | select(.name == "Compile observer candidate" and .event == "push")] | sort_by(.created_at) | last // empty' <<<"$payload")"
+            if [[ -z "$row" ]]; then
+              echo "compile workflow not visible yet (${attempt}/70)"
+              sleep 20
+              continue
+            fi
+
+            status="$(jq -r '.status' <<<"$row")"
+            conclusion="$(jq -r '.conclusion // ""' <<<"$row")"
+            url="$(jq -r '.html_url' <<<"$row")"
+            echo "compile gate: status=${status} conclusion=${conclusion} ${url}"
+
+            if [[ "$status" == "completed" ]]; then
+              if [[ "$conclusion" != "success" ]]; then
+                echo "public engine build/release gate did not succeed" >&2
+                exit 1
+              fi
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "timed out waiting for public engine build/release gate" >&2
+          exit 1
+
+      - name: Download and validate current release evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$EXPERIMENTAL_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern experimental-build-manifest.json \
+            --pattern SHA256SUMS.txt \
+            --dir dist
+
+          python3 <<'PY'
+          import json, os, pathlib
+          manifest = json.loads(pathlib.Path('dist/experimental-build-manifest.json').read_text(encoding='utf-8'))
+          expected = os.environ['GITHUB_SHA']
+          observed = manifest.get('source', {}).get('commit')
+          if observed != expected:
+              raise SystemExit(f"rolling release points at {observed!r}, expected {expected!r}; fail closed")
+          if manifest.get('channel') != os.environ['EXPERIMENTAL_TAG']:
+              raise SystemExit('rolling release channel mismatch')
+          PY
+
+      - name: Generate source snapshot from exact public commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          short="${GITHUB_SHA:0:8}"
+          source_name="semper-oxce-experimental-${UPSTREAM_BASE_VERSION}-g${short}-source.zip"
+          git archive \
+            --format=zip \
+            --prefix="OpenXcom-SemperSupra-g${short}/" \
+            --output="dist/${source_name}" \
+            "$GITHUB_SHA"
+          echo "SOURCE_NAME=${source_name}" >> "$GITHUB_ENV"
+
+      - name: Add source provenance and refresh checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from hashlib import sha256
+          import json, os, pathlib
+
+          root = pathlib.Path('dist')
+          manifest_path = root / 'experimental-build-manifest.json'
+          checksum_path = root / 'SHA256SUMS.txt'
+          source_path = root / os.environ['SOURCE_NAME']
+          candidate = os.environ['GITHUB_SHA']
+          tag = os.environ['EXPERIMENTAL_TAG']
+          repo = os.environ['GITHUB_REPOSITORY']
+
+          def digest(path: pathlib.Path) -> str:
+              h = sha256()
+              with path.open('rb') as fh:
+                  for chunk in iter(lambda: fh.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+          manifest['source_archive'] = {
+              'kind': 'complete-public-source-snapshot',
+              'name': source_path.name,
+              'sha256': digest(source_path),
+              'commit': candidate,
+              'origin': 'exact-public-candidate-commit',
+              'url': f'https://github.com/{repo}/releases/download/{tag}/{source_path.name}',
+              'private_validator_assets_included': False,
+          }
+          manifest_path.write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
+
+          existing = {}
+          for raw in checksum_path.read_text(encoding='utf-8').splitlines():
+              raw = raw.strip()
+              if not raw:
+                  continue
+              digest_text, name = raw.split(None, 1)
+              existing[name.strip()] = digest_text
+
+          # The manifest changed and this source archive is new. Preserve the
+          # already-verified platform hashes from the primary publisher.
+          existing[manifest_path.name] = digest(manifest_path)
+          existing[source_path.name] = digest(source_path)
+          checksum_path.write_text(
+              ''.join(f'{existing[name]}  {name}\n' for name in sorted(existing)),
+              encoding='utf-8',
+          )
+          PY
+
+      - name: Attach source snapshot and updated evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "$EXPERIMENTAL_TAG" \
+            "dist/$SOURCE_NAME" \
+            dist/experimental-build-manifest.json \
+            dist/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+      - name: Verify published source without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          env -u GH_TOKEN -u GITHUB_TOKEN python3 <<'PY'
+          from hashlib import sha256
+          import json, os
+          from urllib.request import Request, urlopen
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          tag = os.environ['EXPERIMENTAL_TAG']
+          candidate = os.environ['GITHUB_SHA']
+          headers = {'User-Agent': 'SemperSupra-source-snapshot-verifier/1'}
+
+          def get(url: str) -> bytes:
+              with urlopen(Request(url, headers=headers), timeout=120) as response:
+                  return response.read()
+
+          release = json.loads(get(f'https://api.github.com/repos/{repo}/releases/tags/{tag}').decode('utf-8'))
+          assets = {a['name']: a for a in release.get('assets', [])}
+          manifest_asset = assets.get('experimental-build-manifest.json')
+          if manifest_asset is None:
+              raise SystemExit('published manifest missing')
+          manifest = json.loads(get(manifest_asset['browser_download_url']).decode('utf-8'))
+          if manifest.get('source', {}).get('commit') != candidate:
+              raise SystemExit('published manifest candidate mismatch')
+          source = manifest.get('source_archive') or {}
+          if source.get('commit') != candidate:
+              raise SystemExit('published source archive candidate mismatch')
+          source_asset = assets.get(source.get('name'))
+          if source_asset is None:
+              raise SystemExit('published source archive missing')
+          data = get(source_asset['browser_download_url'])
+          if sha256(data).hexdigest() != source.get('sha256'):
+              raise SystemExit('published source archive SHA-256 mismatch')
+          print(f'verified public source snapshot {source.get("name")} at {candidate}')
+          PY

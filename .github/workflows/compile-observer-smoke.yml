@@ -1,0 +1,60 @@
+name: Compile observer candidate
+
+on:
+  push:
+    branches:
+      - semper/compile-observer
+  pull_request:
+    branches:
+      - oxce-plus
+  workflow_dispatch:
+
+jobs:
+  observer-contract:
+    name: Observer contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compile smoke test
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror \
+            tests/CompileObserverSmoke.cpp \
+            tests/CompileObserverCrossTu.cpp \
+            -o /tmp/compile-observer-smoke
+
+      - name: Run smoke test
+        run: /tmp/compile-observer-smoke
+
+  windows-engine-build:
+    name: Windows engine build
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install XP toolset used by upstream nightly
+        shell: powershell
+        run: |
+          Set-Location "C:\Program Files (x86)\Microsoft Visual Studio\Installer\"
+          $InstallPath = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise"
+          $WorkLoads = '--add Microsoft.VisualStudio.Component.WinXP'
+          $Arguments = ('/c', "vs_installer.exe", 'modify', '--installPath', "`"$InstallPath`"", $WorkLoads, '--quiet', '--norestart', '--nocache')
+          $process = Start-Process -FilePath cmd.exe -ArgumentList $Arguments -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -ne 0) {
+              throw "XP toolset installation failed with exit code $($process.ExitCode)"
+          }
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Compile OXCE using upstream nightly configuration
+        env:
+          VC_FLAGS: /v:minimal /m /p:BuildInParallel=true /p:PreferredToolArchitecture=x64 /p:Configuration=Release_XP
+        shell: powershell
+        run: |
+          Set-Location src
+          msbuild OpenXcom.2010.sln $env:VC_FLAGS /p:Platform=Win32

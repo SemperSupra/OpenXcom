@@ -38,6 +38,7 @@
 #include "Options.h"
 #include "CrossPlatform.h"
 #include "FileMap.h"
+#include "CompileObserver.h"
 #include "Unicode.h"
 #include "../Ufopaedia/UfopaediaStartState.h"
 #include "../Menu/NotesState.h"
@@ -500,6 +501,7 @@ void Game::setSavedGame(SavedGame *save)
  */
 void Game::loadMods()
 {
+	CompilePhaseScope compilePhase("Game::loadMods");
 	Mod::resetGlobalStatics();
 	delete _mod;
 	_mod = new Mod();

@@ -19,6 +19,10 @@
 #include <sstream>
 #include <exception>
 #include <cassert>
+#include <cstdlib>
+#include <iostream>
+#include <memory>
+#include <string_view>
 #include "version.h"
 #include "Engine/Exception.h"
 #include "Engine/Logger.h"
@@ -26,7 +30,9 @@
 #include "Engine/Game.h"
 #include "Engine/Options.h"
 #include "Engine/FileMap.h"
+#include "Engine/CompileObserver.h"
 #include "Menu/StartState.h"
+#include "Mod/Mod.h"
 
 /** @mainpage
  * @author OpenXcom Developers
@@ -93,6 +99,151 @@ void exceptionLogger()
 
 Game *game = 0;
 
+static bool validateRulesetsRequested() noexcept
+{
+	const char *value = std::getenv("OXCE_VALIDATE_RULESETS");
+	if (!value)
+	{
+		return false;
+	}
+
+	const std::string_view enabled(value);
+	return enabled == "1" || enabled == "true" || enabled == "TRUE" || enabled == "yes" || enabled == "YES";
+}
+
+/**
+ * Emits a deliberately bounded final-state view for the validate-only path.
+ *
+ * This does not reconstruct loader semantics. The real OXCE loader has already
+ * completed successfully; these events only expose identities that survived
+ * into the final item/research maps plus OXCE's existing creation/update
+ * tracking. Observation failures are contained so they cannot change the
+ * loader result.
+ */
+template <typename T>
+static void emitEffectiveRuleSnapshot(const Mod &mod, std::string_view category, const std::string &identity, const T *rule) noexcept
+{
+	if (!getCompileObserver())
+	{
+		return;
+	}
+
+	CompileEvent created;
+	created.kind = CompileEventKind::Snapshot;
+	created.phase = "validate-rulesets";
+	created.category = category;
+	created.operation = "created-by";
+	created.identity = identity;
+	created.outcome = "present";
+	try
+	{
+		const ModData *source = mod.getModCreatingRule(rule);
+		if (source)
+		{
+			created.source = source->name;
+		}
+	}
+	catch (...)
+	{
+		created.outcome = "provenance-unavailable";
+	}
+	emitCompileEvent(created);
+
+	CompileEvent effective;
+	effective.kind = CompileEventKind::Snapshot;
+	effective.phase = "validate-rulesets";
+	effective.category = category;
+	effective.operation = "effective-rule";
+	effective.identity = identity;
+	effective.outcome = "present";
+	try
+	{
+		const ModData *source = mod.getModLastUpdatingRule(rule);
+		if (source)
+		{
+			effective.source = source->name;
+		}
+	}
+	catch (...)
+	{
+		effective.outcome = "provenance-unavailable";
+	}
+	emitCompileEvent(effective);
+}
+
+static void emitValidateOnlySnapshots(const Mod &mod) noexcept
+{
+	if (!getCompileObserver())
+	{
+		return;
+	}
+
+	for (const std::string &identity : mod.getItemsList())
+	{
+		const RuleItem *rule = mod.getItem(identity, false);
+		if (rule)
+		{
+			emitEffectiveRuleSnapshot(mod, "items", identity, rule);
+		}
+	}
+	for (const std::string &identity : mod.getResearchList())
+	{
+		const RuleResearch *rule = mod.getResearch(identity, false);
+		if (rule)
+		{
+			emitEffectiveRuleSnapshot(mod, "research", identity, rule);
+		}
+	}
+}
+
+/**
+ * Runs the authoritative mod/VFS/ruleset load without constructing Game.
+ *
+ * This is intentionally environment-gated for the private spike so the
+ * existing command-line grammar and normal startup path remain untouched.
+ * Callers should provide isolated -user and -cfg paths when using this for
+ * automated evidence generation because normal Options/updateMods behavior
+ * can write configuration and create user folders.
+ */
+static int validateRulesetsAndExit()
+{
+	std::unique_ptr<Mod> mod;
+	try
+	{
+		CompilePhaseScope phase("validate-rulesets");
+
+		// Match the non-persisted initial state established by Game::Game().
+		Options::reload = false;
+		Options::mute = false;
+
+		// This is the same active-mod/VFS setup used by StartState::load().
+		Options::updateMods();
+		Mod::resetGlobalStatics();
+		mod.reset(new Mod());
+		mod->loadAll();
+		emitValidateOnlySnapshots(*mod);
+
+		// The normal Game owns an initialized mixer. This headless path does not;
+		// silence destructor-time playback cleanup after validation has completed.
+		Options::mute = true;
+		mod.reset();
+		FileMap::clear(true, false);
+
+		std::cout << "OXCE ruleset validation succeeded." << std::endl;
+		return EXIT_SUCCESS;
+	}
+	catch (const std::exception &e)
+	{
+		// If loadAll() failed, keep the Mod alive until mixer-using cleanup is muted.
+		Options::mute = true;
+		mod.reset();
+		FileMap::clear(true, false);
+		Log(LOG_ERROR) << "OXCE ruleset validation failed: " << e.what();
+		std::cerr << "OXCE ruleset validation failed: " << e.what() << std::endl;
+		return EXIT_FAILURE;
+	}
+}
+
 // If you can't tell what the main() is for you should have your
 // programming license revoked...
 int main(int argc, char *argv[])
@@ -123,6 +274,11 @@ int main(int argc, char *argv[])
 	title << "OpenXcom " << OPENXCOM_VERSION_SHORT << OPENXCOM_VERSION_GIT;
 	Options::baseXResolution = Options::displayWidth;
 	Options::baseYResolution = Options::displayHeight;
+
+	if (validateRulesetsRequested())
+	{
+		return validateRulesetsAndExit();
+	}
 
 	game = new Game(title.str());
 	State::setGamePtr(game);

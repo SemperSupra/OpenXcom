@@ -1,0 +1,454 @@
+# Public CI and rolling experimental distribution surface for the reviewed compile-observer candidate.
+name: Compile observer candidate
+
+on:
+  push:
+    branches:
+      - semper/compile-observer
+  pull_request:
+    branches:
+      - semper/oxce-8.6.5-base
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_BASE_VERSION: 8.6.5
+  UPSTREAM_BASE_SHA: 668880bb756852f0734cfe92e438e400080a2f4d
+  EXPERIMENTAL_TAG: semper-exp-current
+
+jobs:
+  observer-contract:
+    name: Observer contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout candidate head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Compile smoke test
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror \
+            tests/CompileObserverSmoke.cpp \
+            tests/CompileObserverCrossTu.cpp \
+            -o /tmp/compile-observer-smoke
+
+      - name: Run smoke test
+        run: /tmp/compile-observer-smoke
+
+  linux-engine-build:
+    name: Full Linux engine build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout candidate head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Prepare SemperSupra build identity
+        shell: bash
+        run: |
+          CANDIDATE_SHA="${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+          SHORT_SHA="${CANDIDATE_SHA:0:8}"
+          echo "CANDIDATE_SHA=$CANDIDATE_SHA" >> "$GITHUB_ENV"
+          echo "SHORT_SHA=$SHORT_SHA" >> "$GITHUB_ENV"
+          python3 - "$SHORT_SHA" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          short_sha = sys.argv[1]
+          path = Path("src/version.h")
+          text = path.read_text(encoding="utf-8")
+          text, count = re.subn(
+              r'#define OPENXCOM_VERSION_GIT ".*"',
+              f'#define OPENXCOM_VERSION_GIT " (SemperSupra experimental g{short_sha})"',
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("could not stamp OPENXCOM_VERSION_GIT")
+          path.write_text(text, encoding="utf-8")
+          PY
+
+      - name: Install OXCE build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -yq --no-install-suggests --no-install-recommends install \
+            appstream \
+            libfuse2 \
+            libsdl1.2-dev \
+            libsdl-mixer1.2-dev \
+            libsdl-image1.2-dev \
+            libsdl-gfx1.2-dev
+
+      - name: Install LinuxDeploy
+        uses: miurahr/install-linuxdeploy-action@v1
+        with:
+          plugins: appimage
+
+      - name: Configure OXCE
+        run: cmake . -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+
+      - name: Compile full OXCE engine
+        run: make -j$(nproc)
+
+      - name: Stage Linux AppImage
+        shell: bash
+        run: |
+          make install DESTDIR=AppDir
+          rm -rf AppDir/usr/share/openxcom/UFO
+          rm -rf AppDir/usr/share/openxcom/TFTD
+          mkdir -p AppDir/usr/share/doc/openxcom
+          cat > AppDir/usr/share/doc/openxcom/BUILD-INFO.txt <<EOF
+          UNOFFICIAL / EXPERIMENTAL BUILD
+
+          This build is produced by the SemperSupra OpenXcom fork.
+          It is not an official OXCE release and is not published by MeridianOXC.
+
+          Upstream project: MeridianOXC/OpenXcom
+          Upstream base: OXCE ${UPSTREAM_BASE_VERSION}
+          Upstream commit: ${UPSTREAM_BASE_SHA}
+          SemperSupra source: SemperSupra/OpenXcom
+          Candidate commit: ${CANDIDATE_SHA}
+          Channel: ${EXPERIMENTAL_TAG}
+          Platform: linux-x86_64
+
+          Do not report failures from this build to upstream OXCE unless the
+          problem is independently reproduced on an official upstream build.
+          EOF
+          linuxdeploy-x86_64.AppImage --appdir AppDir --output appimage
+          mkdir -p dist
+          PACKAGE="semper-oxce-experimental-${UPSTREAM_BASE_VERSION}-g${SHORT_SHA}-linux-x86_64.AppImage"
+          mv OpenXcom-x86_64.AppImage "dist/${PACKAGE}"
+          chmod +x "dist/${PACKAGE}"
+
+      - name: Upload Linux package for publisher
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-linux-package
+          path: dist/*
+          if-no-files-found: error
+
+  windows-engine-build:
+    name: Full Windows engine build
+    runs-on: windows-2022
+    steps:
+      - name: Checkout candidate head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Prepare SemperSupra build identity
+        shell: powershell
+        run: |
+          $candidateSha = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+          $shortSha = $candidateSha.Substring(0, 8)
+          Add-Content -Path $env:GITHUB_ENV -Value "CANDIDATE_SHA=$candidateSha"
+          Add-Content -Path $env:GITHUB_ENV -Value "SHORT_SHA=$shortSha"
+          $path = Resolve-Path "src/version.h"
+          $text = [System.IO.File]::ReadAllText($path)
+          $replacement = "#define OPENXCOM_VERSION_GIT `" (SemperSupra experimental g$shortSha)`""
+          $updated = [System.Text.RegularExpressions.Regex]::Replace(
+              $text,
+              '#define OPENXCOM_VERSION_GIT ".*"',
+              $replacement,
+              1
+          )
+          if ($updated -eq $text) { throw "could not stamp OPENXCOM_VERSION_GIT" }
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          [System.IO.File]::WriteAllText($path, $updated, $utf8NoBom)
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Compile OXCE Win32 Release
+        shell: powershell
+        run: |
+          Set-Location src
+          msbuild OpenXcom.2010.sln /v:minimal /m /p:BuildInParallel=true /p:PreferredToolArchitecture=x64 /p:Configuration=Release /p:Platform=Win32
+
+      - name: Stage Windows package
+        shell: powershell
+        run: |
+          $packageName = "semper-oxce-experimental-$env:UPSTREAM_BASE_VERSION-g$env:SHORT_SHA-windows-x86"
+          $stage = Join-Path $PWD "stage\$packageName"
+          $dist = Join-Path $PWD "dist"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item "bin\Win32\Release\OpenXcom.exe" $stage -Force
+          Copy-Item "bin\Win32\*.dll" $stage -Force
+          Copy-Item "bin\common" $stage -Recurse -Force
+          Copy-Item "bin\standard" $stage -Recurse -Force
+          Copy-Item "bin\TFTD" $stage -Recurse -Force
+          Copy-Item "bin\UFO" $stage -Recurse -Force
+          Copy-Item "LICENSE.txt" $stage -Force
+          @"
+          UNOFFICIAL / EXPERIMENTAL BUILD
+
+          This build is produced by the SemperSupra OpenXcom fork.
+          It is not an official OXCE release and is not published by MeridianOXC.
+
+          Upstream project: MeridianOXC/OpenXcom
+          Upstream base: OXCE $env:UPSTREAM_BASE_VERSION
+          Upstream commit: $env:UPSTREAM_BASE_SHA
+          SemperSupra source: SemperSupra/OpenXcom
+          Candidate commit: $env:CANDIDATE_SHA
+          Channel: $env:EXPERIMENTAL_TAG
+          Platform: windows-x86 (compatible with x86_64 Windows)
+
+          Do not report failures from this build to upstream OXCE unless the
+          problem is independently reproduced on an official upstream build.
+          "@ | Set-Content -Path (Join-Path $stage "BUILD-INFO.txt") -Encoding UTF8
+          Compress-Archive -Path "$stage\*" -DestinationPath (Join-Path $dist "$packageName.zip") -Force
+
+      - name: Upload Windows package for publisher
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-windows-package
+          path: dist/*
+          if-no-files-found: error
+
+  publish-experimental:
+    name: Publish rolling experimental channel
+    needs:
+      - observer-contract
+      - linux-engine-build
+      - windows-engine-build
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/semper/compile-observer') ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'semper/compile-observer' && github.base_ref == 'semper/oxce-8.6.5-base')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download platform packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: public-*-package
+          path: dist
+          merge-multiple: true
+
+      - name: Generate machine-readable manifest and checksums
+        shell: bash
+        run: |
+          CANDIDATE_SHA="${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+          SHORT_SHA="${CANDIDATE_SHA:0:8}"
+          export CANDIDATE_SHA SHORT_SHA
+          python3 <<'PY'
+          from __future__ import annotations
+
+          from datetime import datetime, timezone
+          from hashlib import sha256
+          import json
+          import os
+          from pathlib import Path
+
+          dist = Path("dist")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          tag = os.environ["EXPERIMENTAL_TAG"]
+          candidate = os.environ["CANDIDATE_SHA"]
+          base_version = os.environ["UPSTREAM_BASE_VERSION"]
+          base_sha = os.environ["UPSTREAM_BASE_SHA"]
+
+          def digest(path: Path) -> str:
+              h = sha256()
+              with path.open("rb") as fh:
+                  for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          artifacts = []
+          for path in sorted(dist.iterdir()):
+              if not path.is_file():
+                  continue
+              name = path.name
+              if name.endswith("-windows-x86.zip"):
+                  artifacts.append({
+                      "os": "windows",
+                      "arch": "x86",
+                      "compatible_arches": ["x86", "x86_64"],
+                      "kind": "zip",
+                      "entrypoint": "OpenXcom.exe",
+                      "name": name,
+                      "sha256": digest(path),
+                      "url": f"https://github.com/{repo}/releases/download/{tag}/{name}",
+                  })
+              elif name.endswith("-linux-x86_64.AppImage"):
+                  artifacts.append({
+                      "os": "linux",
+                      "arch": "x86_64",
+                      "compatible_arches": ["x86_64"],
+                      "kind": "appimage",
+                      "entrypoint": name,
+                      "name": name,
+                      "sha256": digest(path),
+                      "url": f"https://github.com/{repo}/releases/download/{tag}/{name}",
+                  })
+
+          required = {("windows", "x86"), ("linux", "x86_64")}
+          found = {(a["os"], a["arch"]) for a in artifacts}
+          if found != required:
+              raise SystemExit(f"unexpected platform artifact set: {found!r}")
+
+          manifest = {
+              "schema": 1,
+              "channel": tag,
+              "status": "experimental",
+              "official_oxce": False,
+              "published_at": datetime.now(timezone.utc).isoformat(),
+              "upstream": {
+                  "repository": "MeridianOXC/OpenXcom",
+                  "version": base_version,
+                  "commit": base_sha,
+              },
+              "source": {
+                  "repository": repo,
+                  "branch": "semper/compile-observer",
+                  "commit": candidate,
+              },
+              "release": {
+                  "tag": tag,
+                  "url": f"https://github.com/{repo}/releases/tag/{tag}",
+                  "manifest_url": f"https://github.com/{repo}/releases/download/{tag}/experimental-build-manifest.json",
+              },
+              "artifacts": artifacts,
+          }
+          manifest_path = dist / "experimental-build-manifest.json"
+          manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+          checksum_lines = []
+          for path in sorted(p for p in dist.iterdir() if p.is_file()):
+              checksum_lines.append(f"{digest(path)}  {path.name}")
+          (dist / "SHA256SUMS.txt").write_text("\n".join(checksum_lines) + "\n", encoding="utf-8")
+          PY
+
+      - name: Prepare release notes
+        shell: bash
+        run: |
+          CANDIDATE_SHA="${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+          SHORT_SHA="${CANDIDATE_SHA:0:8}"
+          cat > release-notes.md <<EOF
+          # UNOFFICIAL — SemperSupra OXCE Experimental Build
+
+          **This is not an official OXCE release and is not published by MeridianOXC.**
+
+          This is the rolling SemperSupra development channel used by automated local-agent environments. The tag `semper-exp-current` is intentionally mutable and advances only after the public observer, Linux-engine, and Windows-engine build gates pass.
+
+          - Upstream base: OXCE ${UPSTREAM_BASE_VERSION}
+          - Upstream commit: `${UPSTREAM_BASE_SHA}`
+          - SemperSupra candidate: `${CANDIDATE_SHA}`
+          - Short build id: `g${SHORT_SHA}`
+
+          Agents should resolve `experimental-build-manifest.json`, select the artifact for the host OS/architecture, and verify its SHA-256 before execution.
+
+          Do not report failures from this build to upstream OXCE unless independently reproduced on an official upstream build.
+          EOF
+
+      - name: Move rolling tag and publish prerelease assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CANDIDATE_SHA="${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+          TAG="${EXPERIMENTAL_TAG}"
+
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" \
+              -f sha="${CANDIDATE_SHA}" -F force=true >/dev/null
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${TAG}" -f sha="${CANDIDATE_SHA}" >/dev/null
+          fi
+
+          if RELEASE_ID=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.id' 2>/dev/null); then
+            for ASSET_ID in $(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100" --jq '.[].id'); do
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${ASSET_ID}" >/dev/null
+            done
+            gh release edit "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "UNOFFICIAL — SemperSupra OXCE Experimental Build (${UPSTREAM_BASE_VERSION})" \
+              --notes-file release-notes.md \
+              --prerelease
+          else
+            gh release create "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${CANDIDATE_SHA}" \
+              --title "UNOFFICIAL — SemperSupra OXCE Experimental Build (${UPSTREAM_BASE_VERSION})" \
+              --notes-file release-notes.md \
+              --prerelease
+          fi
+
+          gh release upload "${TAG}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
+
+  verify-public-channel:
+    name: Verify unauthenticated public channel
+    needs:
+      - publish-experimental
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/semper/compile-observer') ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'semper/compile-observer' && github.base_ref == 'semper/oxce-8.6.5-base')
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Resolve manifest and verify all public assets without credentials
+        shell: bash
+        run: |
+          CANDIDATE_SHA="${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+          export CANDIDATE_SHA
+          env -u GH_TOKEN -u GITHUB_TOKEN python3 <<'PY'
+          from hashlib import sha256
+          import json
+          import os
+          from urllib.request import Request, urlopen
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          tag = os.environ["EXPERIMENTAL_TAG"]
+          expected_candidate = os.environ["CANDIDATE_SHA"]
+          headers = {"User-Agent": "SemperSupra-public-channel-verifier/1"}
+
+          def get(url: str) -> bytes:
+              with urlopen(Request(url, headers=headers), timeout=120) as response:
+                  return response.read()
+
+          release_url = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
+          release = json.loads(get(release_url).decode("utf-8"))
+          if release.get("tag_name") != tag or release.get("prerelease") is not True:
+              raise SystemExit("rolling release identity/prerelease state is invalid")
+
+          manifest_asset = next(
+              (a for a in release.get("assets", []) if a.get("name") == "experimental-build-manifest.json"),
+              None,
+          )
+          if manifest_asset is None:
+              raise SystemExit("public manifest asset is missing")
+
+          manifest = json.loads(get(manifest_asset["browser_download_url"]).decode("utf-8"))
+          if manifest.get("schema") != 1 or manifest.get("channel") != tag:
+              raise SystemExit("public manifest schema/channel is invalid")
+          if manifest.get("official_oxce") is not False:
+              raise SystemExit("public manifest does not explicitly identify build as unofficial")
+          if manifest.get("source", {}).get("commit") != expected_candidate:
+              raise SystemExit("rolling release does not point to the candidate that just passed CI")
+
+          observed = set()
+          for artifact in manifest.get("artifacts", []):
+              data = get(artifact["url"])
+              actual = sha256(data).hexdigest()
+              if actual != artifact.get("sha256"):
+                  raise SystemExit(f"SHA-256 mismatch for public asset {artifact.get('name')}")
+              observed.add((artifact.get("os"), artifact.get("arch")))
+
+          required = {("windows", "x86"), ("linux", "x86_64")}
+          if observed != required:
+              raise SystemExit(f"unexpected published platform set: {observed!r}")
+
+          print(f"verified public rolling channel {tag} at {expected_candidate}")
+          PY

@@ -220,6 +220,9 @@ jobs:
       - linux-engine-build
       - windows-engine-build
     if: github.event_name == 'push' && github.ref == 'refs/heads/semper/compile-observer'
+    concurrency:
+      group: semper-exp-current-publisher
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -355,6 +358,12 @@ jobs:
           set -euo pipefail
           CANDIDATE_SHA="${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
           TAG="${EXPERIMENTAL_TAG}"
+          BRANCH="semper/compile-observer"
+          CURRENT_HEAD="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BRANCH}" --jq '.object.sha')"
+          if [[ "${CURRENT_HEAD}" != "${CANDIDATE_SHA}" ]]; then
+            echo "refusing to publish superseded candidate ${CANDIDATE_SHA}; ${BRANCH} is now ${CURRENT_HEAD}" >&2
+            exit 1
+          fi
 
           if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
             gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" \

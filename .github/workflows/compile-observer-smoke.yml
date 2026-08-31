@@ -219,9 +219,7 @@ jobs:
       - observer-contract
       - linux-engine-build
       - windows-engine-build
-    if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/semper/compile-observer') ||
-      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'semper/compile-observer' && github.base_ref == 'semper/oxce-8.6.5-base')
+    if: github.event_name == 'push' && github.ref == 'refs/heads/semper/compile-observer'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -392,9 +390,7 @@ jobs:
     name: Verify unauthenticated public channel
     needs:
       - publish-experimental
-    if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/semper/compile-observer') ||
-      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'semper/compile-observer' && github.base_ref == 'semper/oxce-8.6.5-base')
+    if: github.event_name == 'push' && github.ref == 'refs/heads/semper/compile-observer'
     runs-on: ubuntu-latest
     permissions: {}
     steps:
